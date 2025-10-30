@@ -22,6 +22,40 @@ class RunwayDetector:
         self.upper_threshold = upper_threshold
         self.debug = debug
         self.center_points = []
+        self.raw_center_points = []  # 保存原始未平滑的中心点
+    
+    def _morphological_skeleton(self, image: np.ndarray) -> np.ndarray:
+        """
+        使用形态学操作提取骨架
+        
+        Args:
+            image: 二值图像
+            
+        Returns:
+            骨架图像
+        """
+        skeleton = np.zeros(image.shape, dtype=np.uint8)
+        element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+        
+        temp = image.copy()
+        
+        while True:
+            # 腐蚀
+            eroded = cv2.erode(temp, element)
+            # 开运算
+            opened = cv2.morphologyEx(eroded, cv2.MORPH_OPEN, element)
+            # 从腐蚀结果中减去开运算结果
+            subset = eroded - opened
+            # 累加到骨架
+            skeleton = cv2.bitwise_or(skeleton, subset)
+            # 更新temp
+            temp = eroded.copy()
+            
+            # 如果腐蚀后全为0，停止
+            if cv2.countNonZero(temp) == 0:
+                break
+        
+        return skeleton
         
     def detect_runway(self, image: np.ndarray) -> Tuple[List[np.ndarray], Optional[np.ndarray]]:
         """
@@ -40,26 +74,24 @@ class RunwayDetector:
         # 转换为HSV色彩空间用于检测暗色区域
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
         
-        # 使用更宽的HSV范围来检测黑色/深色跑道
+        # 使用更精确的HSV范围来检测黑色/深色跑道
         # HSV中黑色: V值较低（暗度）
         lower_black = np.array([0, 0, 0])
-        upper_black = np.array([180, 255, 80])  # V值不超过80表示较暗
+        upper_black = np.array([180, 255, 75])  # 降低V值阈值从80到75，更严格
         
         # 创建掩码以检测暗色区域
         mask = cv2.inRange(hsv, lower_black, upper_black)
         
-        # 形态学操作，去除噪点并连接区域
-        kernel_small = np.ones((3, 3), np.uint8)
-        kernel_medium = np.ones((9, 9), np.uint8)
-        kernel_large = np.ones((15, 15), np.uint8)
+        # 形态学操作，去除噪点并连接区域（使用最小核避免边缘扩张）
+        kernel_tiny = np.ones((3, 3), np.uint8)
         
-        # 先闭运算连接断开的区域
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_large)
-        # 再开运算去除小噪点
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_medium)
+        # 只使用一次闭运算连接断开区域
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_tiny)
+        # 只使用一次开运算去除小噪点  
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_tiny)
         
-        # 高斯模糊减小噪声
-        mask = cv2.GaussianBlur(mask, (5, 5), 0)
+        # 不使用高斯模糊，避免边缘模糊
+        # mask = cv2.GaussianBlur(mask, (3, 3), 0)
         
         # 查找轮廓
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -80,203 +112,145 @@ class RunwayDetector:
         # 获取最大的轮廓作为跑道
         runway_contour = valid_contours[0]
         
-        # 简化轮廓
-        epsilon = 0.01 * cv2.arcLength(runway_contour, True)
-        simplified_contour = cv2.approxPolyDP(runway_contour, epsilon, True)
+        # 不简化轮廓，保持原始精度
+        # epsilon = 0.01 * cv2.arcLength(runway_contour, True)
+        # simplified_contour = cv2.approxPolyDP(runway_contour, epsilon, True)
         
-        edges_list = [simplified_contour]
+        edges_list = [runway_contour]  # 直接使用原始轮廓
         
         # 计算跑道的中线
-        # 方法：沿着跑道的弯曲方向采样，对每个采样点找到垂直方向的左右边界
+        # 使用轮廓点对方法：直接从轮廓提取左右边界点对
         centerline = None
         
-        # 获取轮廓的边界框
+        # 创建跑道掩码
+        runway_mask = np.zeros(image.shape[:2], dtype=np.uint8)
+        cv2.drawContours(runway_mask, [runway_contour], -1, 255, -1)
+        
+        # 保存用于诊断
+        self.debug_distance = None
+        self.debug_skeleton = runway_mask.copy()
+        
+        # 方法：扫描每一行，从mask中找到最左和最右的点
+        # 这是最直接、最准确的方法
         x_min, y_min, width, height = cv2.boundingRect(runway_contour)
-        x_max = x_min + width
         y_max = y_min + height
         
-        # 第一步：先用y轴采样得到粗略的中心路径
-        rough_center_points = []
-        for y in range(max(0, y_min), min(image.shape[0], y_max + 1), 10):
-            left_edge = None
-            right_edge = None
-            
-            for x in range(max(0, x_min), min(image.shape[1], x_max + 1)):
-                if cv2.pointPolygonTest(runway_contour, (x, y), True) >= 0:
-                    left_edge = x
-                    break
-            
-            for x in range(min(image.shape[1], x_max), max(0, x_min), -1):
-                if cv2.pointPolygonTest(runway_contour, (x, y), True) >= 0:
-                    right_edge = x
-                    break
-            
-            if left_edge is not None and right_edge is not None:
-                rough_center_x = (left_edge + right_edge) / 2
-                rough_center_points.append((rough_center_x, y))
-        
-        if len(rough_center_points) < 3:
-            return edges_list, None
-        
-        # 第二步：对粗略中心点进行平滑
-        rough_y = np.array([p[1] for p in rough_center_points])
-        rough_x = np.array([p[0] for p in rough_center_points])
-        
-        # 平滑粗略中心线
-        from scipy.ndimage import gaussian_filter1d
-        rough_x = gaussian_filter1d(rough_x, sigma=2.0)
-        
-        # 第三步：沿着粗略中心线，对每个点找垂直方向的左右边界
         center_points = []
         
-        for i in range(len(rough_center_points) - 1):
-            x1, y1 = rough_center_points[i]
-            x2, y2 = rough_center_points[i + 1]
+        # 使用纯几何中点 - 数学上完美对称
+        for y in range(y_min, y_max, 1):
+            row = runway_mask[y, :]
+            x_indices = np.where(row > 0)[0]
             
-            # 计算切线方向（归一化）
-            dx = x2 - x1
-            dy = y2 - y1
-            length = np.sqrt(dx**2 + dy**2)
-            if length < 1e-6:
-                continue
-            dx /= length
-            dy /= length
-            
-            # 垂直方向（逆时针旋转90度）
-            normal_x = -dy
-            normal_y = dx
-            
-            # 从中心点沿垂直方向扫描左右边界
-            max_search = 200  # 最大搜索距离
-            
-            left_dist = None
-            right_dist = None
-            
-            # 向一个方向搜索边界
-            for d in range(1, max_search):
-                test_x = rough_x[i] + normal_x * d
-                test_y = rough_y[i] + normal_y * d
-                if not (0 <= test_x < image.shape[1] and 0 <= test_y < image.shape[0]):
-                    break
-                if cv2.pointPolygonTest(runway_contour, (test_x, test_y), True) < 0:
-                    left_dist = d - 1
-                    break
-            
-            # 向另一个方向搜索边界
-            for d in range(1, max_search):
-                test_x = rough_x[i] - normal_x * d
-                test_y = rough_y[i] - normal_y * d
-                if not (0 <= test_x < image.shape[1] and 0 <= test_y < image.shape[0]):
-                    break
-                if cv2.pointPolygonTest(runway_contour, (test_x, test_y), True) < 0:
-                    right_dist = d - 1
-                    break
-            
-            # 如果找到左右边界，计算真正的中点
-            if left_dist is not None and right_dist is not None:
-                # 计算左右边界的中点
-                # left点位置: rough_x[i] + normal_x * left_dist
-                # right点位置: rough_x[i] - normal_x * right_dist
-                left_x = rough_x[i] + normal_x * left_dist
-                left_y = rough_y[i] + normal_y * left_dist
-                right_x = rough_x[i] - normal_x * right_dist
-                right_y = rough_y[i] - normal_y * right_dist
+            if len(x_indices) >= 2:
+                left_x = float(x_indices[0])
+                right_x = float(x_indices[-1])
                 
-                # 计算中点
-                mid_x = (left_x + right_x) / 2
-                mid_y = (left_y + right_y) / 2
-                center_points.append((mid_x, mid_y))
+                # 纯几何中点
+                center_x = (left_x + right_x) / 2.0
+                center_points.append((center_x, float(y)))
         
-        # 按照y坐标排序
-        if center_points:
-            center_points = sorted(center_points, key=lambda p: p[1])
+        if len(center_points) < 10:
+            print("  警告: 无法提取足够的中心线点")
+            return edges_list, None
         
-        # 如果有足够的中心点，进行智能曲线拟合
-        if len(center_points) >= 10:  # 至少需要10个点
-            center_y_coords = np.array([p[1] for p in center_points])
-            center_x_coords = np.array([p[0] for p in center_points])
+        print(f"  提取 {len(center_points)} 个中心点（逐行扫描）")
+        
+        # 保存原始中心点用于调试
+        self.raw_center_points = center_points.copy()
+        
+        # 如果有足够的中心点，使用平滑处理
+        if len(center_points) >= 10:
+            center_y_coords = np.array([p[1] for p in center_points], dtype=float)
+            center_x_coords = np.array([p[0] for p in center_points], dtype=float)
             
-            # 第一步：对原始采样点进行强度平滑（移动平均）
+            # 移除重复的y坐标（保留每个y的平均x值）
+            unique_y = np.unique(center_y_coords)
+            if len(unique_y) < len(center_y_coords):
+                new_x = []
+                new_y = []
+                for y_val in unique_y:
+                    mask = center_y_coords == y_val
+                    new_x.append(np.mean(center_x_coords[mask]))
+                    new_y.append(y_val)
+                center_x_coords = np.array(new_x)
+                center_y_coords = np.array(new_y)
+            
+            # 极简平滑：最大限度保持原始几何中点的准确性
             from scipy.ndimage import uniform_filter1d, gaussian_filter1d
+            from scipy.signal import medfilt, savgol_filter
             
-            # 使用较大的移动平均平滑采样点，窗口大小为7-11
-            window_size = min(11, len(center_x_coords) // 2)
-            if window_size >= 5:
-                # 先用较大的窗口平滑
-                center_x_coords = uniform_filter1d(center_x_coords, size=window_size, mode='nearest')
-                # 再用高斯滤波进一步平滑
-                center_x_coords = gaussian_filter1d(center_x_coords, sigma=1.5, mode='nearest')
+            # 只做最基本的去噪，不改变几何位置
+            # Savitzky-Golay滤波是最好的选择：去噪同时保持形状
+            if len(center_x_coords) > 20:
+                window = min(15, len(center_x_coords) // 8 * 2 + 1)  # 小窗口
+                if window >= 5:
+                    try:
+                        center_x_coords = savgol_filter(center_x_coords, window, polyorder=3)
+                    except:
+                        pass
             
-            # 计算权重：近处的点权重更大
-            y_normalized = (center_y_coords - center_y_coords.min()) / (center_y_coords.max() - center_y_coords.min() + 1e-6)
-            weights = (1.0 - y_normalized) ** 2  # 上部权重更大
-            weights = weights / weights.sum() * len(center_points)
-            
-            # 首先尝试使用分段样条插值（更自然）
+            # 使用参数化B样条拟合
             try:
-                from scipy.interpolate import UnivariateSpline
+                from scipy.interpolate import splprep, splev
                 
-                # 使用自适应平滑度的样条插值
-                # s参数控制平滑度：越小越紧贴数据点，越大越平滑
-                # 根据跑道形状自动调整
-                # 计算数据点的方差来估计合理的平滑度
-                x_variance = np.var(center_x_coords)
-                # 使用方差的倍数作为平滑度参数
-                smooth_factor = x_variance * 0.5  # 调整这个系数来控制平滑度
+                # 确保点按顺序排列
+                sort_idx = np.argsort(center_y_coords)
+                center_x_sorted = center_x_coords[sort_idx]
+                center_y_sorted = center_y_coords[sort_idx]
                 
-                # 尝试多个平滑度参数，选择最平滑但误差可接受的
-                best_spline = None
-                best_error = float('inf')
+                # 使用极小的平滑度，紧密跟随原始数据
+                smooth_factor = len(center_points) * 0.5  # 最小平滑因子，几乎不偏离原始点
                 
-                # 增大平滑度搜索范围，优先选择更平滑的
-                for s_factor in [1.0, 3.0, 5.0, 10.0, 20.0, 50.0]:
-                    try:
-                        test_spline = UnivariateSpline(center_y_coords, center_x_coords, s=x_variance * s_factor, k=min(3, len(center_points)-1))
-                        predicted_x = test_spline(center_y_coords)
-                        error = np.mean((center_x_coords - predicted_x) ** 2)
-                        # 允许更大的误差以获得更平滑的效果
-                        if error < x_variance * 10:  # 增大误差容忍度
-                            if error < best_error:
-                                best_error = error
-                                best_spline = test_spline
-                    except:
-                        continue
+                # 参数化B样条拟合
+                tck, u = splprep([center_x_sorted, center_y_sorted], 
+                                s=smooth_factor, 
+                                k=min(3, len(center_points)-1))
                 
-                # 如果找到合适的spline就用它，否则用更大的平滑度
-                if best_spline is not None:
-                    spline = best_spline
-                else:
-                    # 使用更大的平滑度参数以减少抖动
-                    spline = UnivariateSpline(center_y_coords, center_x_coords, s=x_variance * 10.0, k=min(3, len(center_points)-1))
+                # 生成密集的采样点
+                u_fine = np.linspace(0, 1, 3000)
+                x_fine, y_fine = splev(u_fine, tck)
                 
-                # 将样条保存为多项式分段形式（用于快速计算）
-                self.centerline_type = 'spline'
-                self.spline_func = spline
-                self.spline_y_range = (center_y_coords.min(), center_y_coords.max())
+                # 保存为查找表
+                self.centerline_type = 'parametric_spline'
+                self.param_spline = tck
+                self.spline_x_lookup = x_fine
+                self.spline_y_lookup = y_fine
+                self.spline_y_range = (y_fine.min(), y_fine.max())
                 
-                centerline = 'spline'  # 标记为样条类型
+                centerline = 'parametric_spline'
                 
-            except ImportError:
-                # 如果没有scipy，回退到加权多项式拟合
-                best_coeffs = None
-                best_error = float('inf')
-                best_degree = 2
-                
-                for degree in [3, 4, 5]:  # 提高最高阶数
-                    try:
-                        coeffs = np.polyfit(center_y_coords, center_x_coords, degree, w=weights)
-                        predicted_x = np.polyval(coeffs, center_y_coords)
-                        error = np.mean(weights * (center_x_coords - predicted_x) ** 2)
-                        
-                        if error < best_error:
-                            best_error = error
-                            best_coeffs = coeffs
-                            best_degree = degree
-                    except:
-                        continue
-                
-                centerline = best_coeffs
-                self.centerline_type = 'poly'
+            except Exception as e:
+                print(f"  警告: 参数化样条拟合失败 ({e})，使用备用方法")
+                # 备用方案：使用简单的y->x样条
+                try:
+                    from scipy.interpolate import UnivariateSpline
+                    
+                    sort_idx = np.argsort(center_y_coords)
+                    center_y_sorted = center_y_coords[sort_idx]
+                    center_x_sorted = center_x_coords[sort_idx]
+                    
+                    # 使用较小的平滑度
+                    spline = UnivariateSpline(center_y_sorted, center_x_sorted, 
+                                             s=len(center_points) * 5.0,  # 从20降到5
+                                             k=min(3, len(center_points)-1))
+                    
+                    self.centerline_type = 'spline'
+                    self.spline_func = spline
+                    self.spline_y_range = (center_y_sorted.min(), center_y_sorted.max())
+                    centerline = 'spline'
+                    
+                except Exception as e2:
+                    print(f"  警告: 样条拟合也失败了 ({e2})，使用多项式")
+                    # 最终备用：多项式拟合
+                    sort_idx = np.argsort(center_y_coords)
+                    center_y_sorted = center_y_coords[sort_idx]
+                    center_x_sorted = center_x_coords[sort_idx]
+                    
+                    degree = min(5, len(center_points) - 1)
+                    coeffs = np.polyfit(center_y_sorted, center_x_sorted, degree)
+                    centerline = coeffs
+                    self.centerline_type = 'poly'
         else:
             centerline = None
             self.centerline_type = None
@@ -307,31 +281,62 @@ class RunwayDetector:
         # 绘制中线
         if centerline is not None:
             height = image.shape[0]
+            width = image.shape[1]
             points = []
             
             # 判断centerline类型
-            if hasattr(self, 'centerline_type') and self.centerline_type == 'spline':
+            if hasattr(self, 'centerline_type') and self.centerline_type == 'parametric_spline':
+                # 使用参数化样条曲线 - 改进的插值方法
+                if hasattr(self, 'spline_x_lookup') and hasattr(self, 'spline_y_lookup'):
+                    # 对每个y坐标，使用二分查找或插值找到最佳x
+                    y_lookup = self.spline_y_lookup
+                    x_lookup = self.spline_x_lookup
+                    
+                    # 创建从y到索引的映射（使用插值）
+                    from scipy.interpolate import interp1d
+                    
+                    # 确保y_lookup是单调的（如果不是，需要处理）
+                    # 对于非单调情况，我们按y排序并取平均
+                    y_min, y_max = y_lookup.min(), y_lookup.max()
+                    
+                    # 为每个图像y坐标找到对应的x
+                    for y in range(0, height):
+                        if y_min <= y <= y_max:
+                            # 找到lookup表中最接近的点
+                            distances = np.abs(y_lookup - y)
+                            # 取最近的几个点的平均
+                            closest_indices = np.argsort(distances)[:5]
+                            x = np.mean(x_lookup[closest_indices])
+                        elif y < y_min:
+                            # 外推：使用起点
+                            x = x_lookup[0]
+                        else:
+                            # 外推：使用终点
+                            x = x_lookup[-1]
+                        
+                        x = max(0, min(int(round(x)), width - 1))
+                        points.append((x, y))
+                        
+            elif hasattr(self, 'centerline_type') and self.centerline_type == 'spline':
                 # 使用样条插值
                 y_min, y_max = self.spline_y_range
                 
-                for y in range(0, height, 1):
+                for y in range(0, height):
                     if y_min <= y <= y_max:
                         x = self.spline_func(y)
                     elif y < y_min:
-                        # 向上外推：使用第一个点的斜率
                         x = self.spline_func(y_min)
                     else:
-                        # 向下外推：使用最后一个点的斜率
                         x = self.spline_func(y_max)
                     
-                    x = max(0, min(int(x), image.shape[1] - 1))
+                    x = max(0, min(int(round(x)), width - 1))
                     points.append((x, y))
                     
             else:
                 # 使用多项式
-                for y in range(0, height, 1):
+                for y in range(0, height):
                     x = np.polyval(centerline, y)
-                    x = max(0, min(int(x), image.shape[1] - 1))
+                    x = max(0, min(int(round(x)), width - 1))
                     points.append((x, y))
             
             # 绘制中线（使用抗锯齿线条）
@@ -343,18 +348,22 @@ class RunwayDetector:
             
             # 绘制采样点（调试模式）
             if self.debug and hasattr(self, 'center_points'):
-                # 绘制原始采样点（黄色）
-                for point in self.center_points[::10]:  # 每10个点绘制一个
-                    cv2.circle(result, tuple(map(int, point)), 4, (0, 255, 255), -1)
+                # 绘制原始采样点（黄色小圆点）
+                if hasattr(self, 'raw_center_points'):
+                    for i, point in enumerate(self.raw_center_points):
+                        if i % 10 == 0:  # 每10个点绘制一个
+                            cv2.circle(result, tuple(map(int, point)), 3, (0, 255, 255), -1)
+                
                 # 绘制拟合曲线上的点（紫色）
                 if len(points) > 0:
-                    for point in points[::50]:  # 每50个点绘制一个
-                        cv2.circle(result, point, 3, (255, 0, 255), -1)
+                    for i, point in enumerate(points):
+                        if i % 50 == 0:  # 每50个点绘制一个
+                            cv2.circle(result, point, 2, (255, 0, 255), -1)
         
         return result
 
 
-def process_image(input_path: str, output_path: str) -> bool:
+def process_image(input_path: str, output_path: str, save_diagnostics: bool = False) -> bool:
     """处理单张图像"""
     if not os.path.exists(input_path):
         print(f"错误: 找不到文件 {input_path}")
@@ -392,6 +401,23 @@ def process_image(input_path: str, output_path: str) -> bool:
     # 保存结果
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     cv2.imwrite(output_path, result)
+    
+    # 保存诊断图像（如果需要）
+    if save_diagnostics and hasattr(detector, 'debug_skeleton'):
+        base_name = os.path.splitext(output_path)[0]
+        
+        # 保存骨架图
+        if detector.debug_skeleton is not None:
+            skeleton_colored = cv2.cvtColor(detector.debug_skeleton, cv2.COLOR_GRAY2BGR)
+            cv2.imwrite(f"{base_name}_skeleton.png", skeleton_colored)
+            print(f"  [+] 骨架图已保存: {base_name}_skeleton.png")
+        
+        # 保存距离变换图（如果存在）
+        if hasattr(detector, 'debug_distance') and detector.debug_distance is not None:
+            dist_colored = cv2.normalize(detector.debug_distance, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+            dist_colored = cv2.applyColorMap(dist_colored, cv2.COLORMAP_JET)
+            cv2.imwrite(f"{base_name}_distance.png", dist_colored)
+            print(f"  [+] 距离变换图已保存: {base_name}_distance.png")
     
     print(f"  [+] 结果已保存到: {output_path}")
     return True

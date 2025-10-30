@@ -33,6 +33,9 @@ def main():
         input_files.extend(glob.glob(f"input/*{ext}"))
         input_files.extend(glob.glob(f"input/*{ext.upper()}"))
     
+    # 去除重复文件（同一文件可能被小写和大写扩展名都匹配到）
+    input_files = list(set(input_files))
+    
     if not input_files:
         print("错误: input文件夹中没有找到任何文件")
         return
