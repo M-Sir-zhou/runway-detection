@@ -9,7 +9,8 @@ class RunwayDetector:
     
     def __init__(self, lower_threshold: Tuple[int, int, int] = (0, 0, 0), 
                  upper_threshold: Tuple[int, int, int] = (50, 50, 50),
-                 debug: bool = False):
+                 debug: bool = False,
+                 pixels_per_meter: float = 100.0):
         """
         初始化检测器
         
@@ -17,12 +18,16 @@ class RunwayDetector:
             lower_threshold: HSV颜色空间下黑色跑道的下界
             upper_threshold: HSV颜色空间下黑色跑道的上界
             debug: 是否启用调试模式（显示采样点）
+            pixels_per_meter: 像素到米的转换比例（默认100像素=1米，可根据实际情况校准）
         """
         self.lower_threshold = lower_threshold
         self.upper_threshold = upper_threshold
         self.debug = debug
+        self.pixels_per_meter = pixels_per_meter
         self.center_points = []
         self.raw_center_points = []  # 保存原始未平滑的中心点
+        self.drone_offset_pixels = None  # 无人机偏离像素距离
+        self.drone_offset_meters = None  # 无人机偏离实际距离（米）
     
     def _morphological_skeleton(self, image: np.ndarray) -> np.ndarray:
         """
@@ -260,8 +265,101 @@ class RunwayDetector:
         
         return edges_list, centerline
     
+    def calculate_drone_offset(self, image: np.ndarray, drone_x: Optional[int] = None, 
+                              drone_y: Optional[int] = None) -> Tuple[float, float]:
+        """
+        计算无人机与跑道中线的偏离距离
+        
+        Args:
+            image: 图像（用于获取尺寸）
+            drone_x: 无人机在图像中的x坐标（默认为图像中心）
+            drone_y: 无人机在图像中的y坐标（默认为图像中心）
+            
+        Returns:
+            (offset_pixels, offset_meters): 偏离距离（像素和米）
+                - 正值表示无人机在中线右侧
+                - 负值表示无人机在中线左侧
+        """
+        height, width = image.shape[:2]
+        
+        # 默认使用图像中心作为无人机位置
+        if drone_x is None:
+            drone_x = width // 2
+        if drone_y is None:
+            drone_y = height // 2
+        
+        # 检查是否有中线数据
+        if not hasattr(self, 'centerline_type') or self.centerline_type is None:
+            print("  警告: 未检测到中线，无法计算偏离距离")
+            self.drone_offset_pixels = 0.0
+            self.drone_offset_meters = 0.0
+            return 0.0, 0.0
+        
+        # 根据不同的中线类型计算中线在drone_y位置的x坐标
+        centerline_x = None
+        
+        try:
+            if self.centerline_type == 'parametric_spline':
+                # 参数化样条：在查找表中找到最接近drone_y的点
+                if hasattr(self, 'spline_y_lookup') and hasattr(self, 'spline_x_lookup'):
+                    y_lookup = self.spline_y_lookup
+                    x_lookup = self.spline_x_lookup
+                    
+                    # 找到最接近drone_y的索引
+                    idx = np.argmin(np.abs(y_lookup - drone_y))
+                    centerline_x = x_lookup[idx]
+                    
+            elif self.centerline_type == 'spline':
+                # 单变量样条：直接计算
+                if hasattr(self, 'spline_func') and hasattr(self, 'spline_y_range'):
+                    y_min, y_max = self.spline_y_range
+                    if y_min <= drone_y <= y_max:
+                        centerline_x = float(self.spline_func(drone_y))
+                        
+            elif self.centerline_type == 'poly':
+                # 多项式：使用保存的系数
+                if hasattr(self, 'centerline_coeffs'):
+                    centerline_x = np.polyval(self.centerline_coeffs, drone_y)
+            
+            # 如果无法计算，尝试从原始中心点插值
+            if centerline_x is None and len(self.center_points) > 0:
+                center_points = np.array(self.center_points)
+                center_y = center_points[:, 1]
+                center_x = center_points[:, 0]
+                
+                # 找到最接近drone_y的点
+                idx = np.argmin(np.abs(center_y - drone_y))
+                centerline_x = center_x[idx]
+            
+            if centerline_x is None:
+                print("  警告: 无法计算中线位置")
+                self.drone_offset_pixels = 0.0
+                self.drone_offset_meters = 0.0
+                return 0.0, 0.0
+            
+            # 计算偏离距离（像素）
+            offset_pixels = float(drone_x - centerline_x)
+            
+            # 转换为实际距离（米）
+            offset_meters = offset_pixels / self.pixels_per_meter
+            
+            # 保存结果
+            self.drone_offset_pixels = offset_pixels
+            self.drone_offset_meters = offset_meters
+            
+            return offset_pixels, offset_meters
+            
+        except Exception as e:
+            print(f"  警告: 计算偏离距离时出错: {e}")
+            self.drone_offset_pixels = 0.0
+            self.drone_offset_meters = 0.0
+            return 0.0, 0.0
+    
     def visualize(self, image: np.ndarray, edges: List[np.ndarray], 
-                  centerline: Optional[np.ndarray]) -> np.ndarray:
+                  centerline: Optional[np.ndarray], 
+                  show_drone_offset: bool = True,
+                  drone_x: Optional[int] = None,
+                  drone_y: Optional[int] = None) -> np.ndarray:
         """
         可视化检测结果
         
@@ -269,11 +367,21 @@ class RunwayDetector:
             image: 原始图像
             edges: 检测到的边缘
             centerline: 中线系数
+            show_drone_offset: 是否显示无人机偏离信息
+            drone_x: 无人机x坐标（默认为图像中心）
+            drone_y: 无人机y坐标（默认为图像中心）
             
         Returns:
             可视化后的图像
         """
         result = image.copy()
+        height, width = image.shape[:2]
+        
+        # 默认使用图像中心作为无人机位置
+        if drone_x is None:
+            drone_x = width // 2
+        if drone_y is None:
+            drone_y = height // 2
         
         # 绘制边缘
         cv2.drawContours(result, edges, -1, (0, 255, 0), 3)
@@ -346,6 +454,73 @@ class RunwayDetector:
                     pt2 = tuple(points[i+1])
                     cv2.line(result, pt1, pt2, (255, 0, 0), 3)
             
+            # 计算并显示无人机偏离信息
+            if show_drone_offset:
+                offset_pixels, offset_meters = self.calculate_drone_offset(image, drone_x, drone_y)
+                
+                # 绘制无人机位置（红色十字）
+                cross_size = 20
+                cv2.line(result, (drone_x - cross_size, drone_y), 
+                        (drone_x + cross_size, drone_y), (0, 0, 255), 3)
+                cv2.line(result, (drone_x, drone_y - cross_size), 
+                        (drone_x, drone_y + cross_size), (0, 0, 255), 3)
+                cv2.circle(result, (drone_x, drone_y), 8, (0, 0, 255), 2)
+                
+                # 找到中线在drone_y位置的x坐标
+                if self.centerline_type == 'parametric_spline' and hasattr(self, 'spline_y_lookup'):
+                    idx = np.argmin(np.abs(self.spline_y_lookup - drone_y))
+                    centerline_x = int(self.spline_x_lookup[idx])
+                elif self.centerline_type == 'spline' and hasattr(self, 'spline_func'):
+                    y_min, y_max = self.spline_y_range
+                    if y_min <= drone_y <= y_max:
+                        centerline_x = int(self.spline_func(drone_y))
+                    else:
+                        centerline_x = drone_x
+                else:
+                    # 在points中找最接近drone_y的点
+                    if len(points) > 0:
+                        min_dist = float('inf')
+                        centerline_x = drone_x
+                        for px, py in points:
+                            dist = abs(py - drone_y)
+                            if dist < min_dist:
+                                min_dist = dist
+                                centerline_x = px
+                    else:
+                        centerline_x = drone_x
+                
+                # 绘制从无人机到中线的连线（黄色虚线）
+                cv2.line(result, (drone_x, drone_y), 
+                        (centerline_x, drone_y), (0, 255, 255), 2)
+                
+                # 在中线交点处绘制标记（黄色圆圈）
+                cv2.circle(result, (centerline_x, drone_y), 6, (0, 255, 255), 2)
+                
+                # 显示偏离信息（使用英文避免中文显示问题）
+                direction = "Right" if offset_pixels > 0 else "Left" if offset_pixels < 0 else "Center"
+                
+                # 创建信息面板（半透明背景）
+                overlay = result.copy()
+                panel_height = 120
+                cv2.rectangle(overlay, (10, 10), (400, panel_height), (0, 0, 0), -1)
+                cv2.addWeighted(overlay, 0.6, result, 0.4, 0, result)
+                
+                # 显示文字信息
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                y_offset = 35
+                cv2.putText(result, f"Drone Offset Analysis", 
+                           (20, y_offset), font, 0.6, (255, 255, 255), 2)
+                y_offset += 25
+                cv2.putText(result, f"Distance: {abs(offset_pixels):.1f} pixels", 
+                           (20, y_offset), font, 0.5, (0, 255, 255), 1)
+                y_offset += 22
+                cv2.putText(result, f"Distance: {abs(offset_meters):.3f} meters", 
+                           (20, y_offset), font, 0.5, (0, 255, 255), 1)
+                y_offset += 22
+                cv2.putText(result, f"Direction: {direction}", 
+                           (20, y_offset), font, 0.5, 
+                           (0, 0, 255) if offset_pixels != 0 else (0, 255, 0), 1)
+            
             # 绘制采样点（调试模式）
             if self.debug and hasattr(self, 'center_points'):
                 # 绘制原始采样点（黄色小圆点）
@@ -363,8 +538,23 @@ class RunwayDetector:
         return result
 
 
-def process_image(input_path: str, output_path: str, save_diagnostics: bool = False) -> bool:
-    """处理单张图像"""
+def process_image(input_path: str, output_path: str, save_diagnostics: bool = False,
+                 pixels_per_meter: float = 100.0, drone_x: Optional[int] = None, 
+                 drone_y: Optional[int] = None) -> bool:
+    """
+    处理单张图像
+    
+    Args:
+        input_path: 输入图像路径
+        output_path: 输出图像路径
+        save_diagnostics: 是否保存诊断图像
+        pixels_per_meter: 像素到米的转换比例（用于校准实际距离）
+        drone_x: 无人机x坐标（默认为图像中心）
+        drone_y: 无人机y坐标（默认为图像中心）
+    
+    Returns:
+        是否处理成功
+    """
     if not os.path.exists(input_path):
         print(f"错误: 找不到文件 {input_path}")
         return False
@@ -379,7 +569,7 @@ def process_image(input_path: str, output_path: str, save_diagnostics: bool = Fa
     print(f"  图像尺寸: {image.shape}")
     
     # 创建检测器（设置debug=True可以看到采样点）
-    detector = RunwayDetector(debug=False)
+    detector = RunwayDetector(debug=False, pixels_per_meter=pixels_per_meter)
     
     # 检测跑道
     edges, centerline = detector.detect_runway(image)
@@ -392,11 +582,18 @@ def process_image(input_path: str, output_path: str, save_diagnostics: bool = Fa
     
     if centerline is not None:
         print(f"  [+] 成功计算出中线")
+        
+        # 计算并输出偏离距离
+        offset_pixels, offset_meters = detector.calculate_drone_offset(image, drone_x, drone_y)
+        direction = "右侧" if offset_pixels > 0 else "左侧" if offset_pixels < 0 else "中线上"
+        print(f"  [+] 无人机偏离: {abs(offset_pixels):.1f} 像素 / {abs(offset_meters):.3f} 米 ({direction})")
     else:
         print(f"  [-] 未能计算出中线")
     
-    # 可视化结果
-    result = detector.visualize(image, edges, centerline)
+    # 可视化结果（显示偏离信息）
+    result = detector.visualize(image, edges, centerline, 
+                               show_drone_offset=True, 
+                               drone_x=drone_x, drone_y=drone_y)
     
     # 保存结果
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -423,8 +620,25 @@ def process_image(input_path: str, output_path: str, save_diagnostics: bool = Fa
     return True
 
 
-def process_video(input_path: str, output_path: str) -> bool:
-    """处理视频文件"""
+def process_video(input_path: str, output_path: str, 
+                 pixels_per_meter: float = 100.0,
+                 drone_x: Optional[int] = None, 
+                 drone_y: Optional[int] = None,
+                 log_offsets: bool = False) -> bool:
+    """
+    处理视频文件
+    
+    Args:
+        input_path: 输入视频路径
+        output_path: 输出视频路径
+        pixels_per_meter: 像素到米的转换比例
+        drone_x: 无人机x坐标（默认为图像中心）
+        drone_y: 无人机y坐标（默认为图像中心）
+        log_offsets: 是否记录每帧的偏离数据到CSV文件
+    
+    Returns:
+        是否处理成功
+    """
     if not os.path.exists(input_path):
         print(f"错误: 找不到文件 {input_path}")
         return False
@@ -449,7 +663,10 @@ def process_video(input_path: str, output_path: str) -> bool:
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
     
     # 创建检测器
-    detector = RunwayDetector()
+    detector = RunwayDetector(pixels_per_meter=pixels_per_meter)
+    
+    # 如果需要记录偏离数据
+    offset_log = []
     
     frame_count = 0
     while True:
@@ -460,19 +677,50 @@ def process_video(input_path: str, output_path: str) -> bool:
         # 检测跑道
         edges, centerline = detector.detect_runway(frame)
         
-        # 可视化结果
-        result = detector.visualize(frame, edges, centerline)
+        # 可视化结果（显示偏离信息）
+        result = detector.visualize(frame, edges, centerline,
+                                   show_drone_offset=True,
+                                   drone_x=drone_x, drone_y=drone_y)
+        
+        # 记录偏离数据
+        if log_offsets and hasattr(detector, 'drone_offset_pixels'):
+            offset_log.append({
+                'frame': frame_count,
+                'time_sec': frame_count / fps,
+                'offset_pixels': detector.drone_offset_pixels,
+                'offset_meters': detector.drone_offset_meters
+            })
         
         # 写入帧
         out.write(result)
         
         frame_count += 1
         if frame_count % 30 == 0 or frame_count == 1:
-            print(f"  已处理帧: {frame_count}/{total_frames}")
+            offset_info = ""
+            if hasattr(detector, 'drone_offset_meters'):
+                offset_info = f" (偏离: {abs(detector.drone_offset_meters):.3f}m)"
+            print(f"  已处理帧: {frame_count}/{total_frames}{offset_info}")
     
     # 释放资源
     cap.release()
     out.release()
+    
+    # 保存偏离数据日志
+    if log_offsets and len(offset_log) > 0:
+        import csv
+        log_path = output_path.replace('.mp4', '_offset_log.csv')
+        with open(log_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=['frame', 'time_sec', 'offset_pixels', 'offset_meters'])
+            writer.writeheader()
+            writer.writerows(offset_log)
+        print(f"  [+] 偏离数据已保存到: {log_path}")
+        
+        # 计算统计信息
+        offsets = [abs(d['offset_meters']) for d in offset_log]
+        avg_offset = np.mean(offsets)
+        max_offset = np.max(offsets)
+        min_offset = np.min(offsets)
+        print(f"  [统计] 平均偏离: {avg_offset:.3f}m, 最大: {max_offset:.3f}m, 最小: {min_offset:.3f}m")
     
     print(f"  [+] 成功处理视频: {input_path} -> {output_path}")
     print(f"  共处理 {frame_count} 帧")
